@@ -129,7 +129,7 @@ public partial class BasicCommands(JellyfinApiClient apiCLient, JellyfinSdkSetti
         {
             Console.WriteLine(":");
             foreach (var child in all.Where(c => c.ParentId == parent.Id))
-                recursiveList(child, all, tabs + 1);
+                await recursiveList(child, all, tabs + 1);
         } else
         {
             Console.WriteLine();
@@ -157,7 +157,7 @@ public partial class BasicCommands(JellyfinApiClient apiCLient, JellyfinSdkSetti
         {
             foreach (var child in all.Where(c => c.ParentId == parent.Id) ?? [])
             {
-                recursiveList(child, all, tabs);   
+                await recursiveList(child, all, tabs);   
             }
         }
         
