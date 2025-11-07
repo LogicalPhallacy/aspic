@@ -78,9 +78,50 @@ public partial class BasicCommands
             }
         }
         _ = Directory.CreateDirectory(destDir);
-
-        await AnsiConsole.Progress().Columns([new SpinnerColumn(), new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new RemainingTimeColumn()])
-            .StartAsync(async ctx =>
+        // Redo our progress table rendering
+        var layoutTable = new Table().RoundedBorder().Expand();
+        layoutTable.Title("Download Progress");
+        layoutTable
+            .AddColumn(new TableColumn("Download Operation").Alignment(Justify.Left).Width(60).Footer(new BreakdownChart()))
+            .AddColumn(new TableColumn("Progress").Alignment(Justify.Left).Width(40));
+        var progress = AnsiConsole.Progress()
+            .AutoRefresh(true) // Turn off auto refresh
+            .AutoClear(false)   // Do not remove the task list when done
+            .HideCompleted(false)   // Hide tasks as they are completed
+            .UseRenderHook((renderable, taskList) =>
+            {
+                var sortedTasks = taskList.Where(t => !t.IsFinished).OrderByDescending(t => t.Percentage);
+                // Set this in the loop to handle window resizing
+                var rowLimit = Console.WindowHeight - 10;
+                // quick lets math some stuff
+                var totalTasks = taskList.Count;
+                var completedTasks = taskList.Count(t => t.IsFinished);
+                var activeCount = totalTasks - completedTasks;
+                var allShowing = activeCount <= rowLimit;
+                if (allShowing)
+                {
+                    rowLimit = activeCount;
+                }
+                var totalTaskProgress = taskList.Sum(t => t.Value);
+                var totalTaskMax = taskList.Sum(t => t.MaxValue);
+                layoutTable.Columns.First().Header = new Panel($"[bold yellow]{activeCount} remaining out of {totalTasks}[/]").NoBorder();
+                layoutTable.Columns.Last().Header = new Panel($"[bold yellow]Displaying {rowLimit} downloads[/]").NoBorder();
+                layoutTable.Rows.Clear();
+                foreach (var task in sortedTasks.Take(allShowing ? rowLimit : rowLimit - 1))
+                {
+                    AddTaskRow(layoutTable, task);
+                }
+                if (!allShowing)
+                {
+                    var longestDepot = sortedTasks.LastOrDefault();
+                    layoutTable.AddRow([new Markup("..."), new Markup("...")]);
+                    AddTaskRow(layoutTable, longestDepot);
+                }
+                layoutTable.Columns.Last().Footer = new BreakdownChart().AddItem("Downloads Finished", completedTasks, Color.Green).AddItem("Downloads Processing", totalTasks - completedTasks, Color.Gold1);
+                return layoutTable;
+            });
+            progress.RefreshRate = TimeSpan.FromMilliseconds(500);
+            await progress.StartAsync(async ctx =>
             {
                 // Define tasks
                 if ((item.ChildCount ?? 0) > 0)
@@ -88,12 +129,13 @@ public partial class BasicCommands
                     // Handle downloading child items if this is a collection
                     Console.WriteLine("This is a collection, creating folder and downloading child items...");
                     destDir = Path.Combine(destDir, sanitizeDirectoryName(item.Name));
+                    layoutTable.Title($"Download Progress for Collection: {item.Name}");
                     _ = Directory.CreateDirectory(destDir);
                     SemaphoreSlim semaphore = new SemaphoreSlim(throttle);
                     var children = await apiCLient.Items.GetAsync(req => {
                         req.QueryParameters.ParentId = item.Id;
                         req.QueryParameters.Fields = [ItemFields.MediaSources, ItemFields.Path];
-                        });
+                    });
                     List<Task> downloadTasks = new List<Task>();
                     foreach (var child in children.Items ?? [])
                     {
@@ -102,7 +144,7 @@ public partial class BasicCommands
                             Console.Error.WriteLine($"No media sources available for {child.Name}.");
                             continue;
                         }
-                        var childDownload = ctx.AddTask($"[green]{child.Name}[/]", false, maxValue: 100);
+                        var childDownload = ctx.AddTask($"[green]{child.Name}[/]", false, maxValue: 101);
                         if (child.Path is not null)
                         {
                             destFile = sanitizeFileName(Path.GetFileName(child.Path));
@@ -113,7 +155,7 @@ public partial class BasicCommands
                 }
                 else
                 {
-                    var download = ctx.AddTask($"[green]Downloading {item.Name}[/]", maxValue: 100);
+                    var download = ctx.AddTask($"[green]Downloading {item.Name}[/]", maxValue: 101);
                     if (item.Path is not null)
                     {
                         destFile = sanitizeFileName(Path.GetFileName(item.Path));
@@ -123,46 +165,55 @@ public partial class BasicCommands
             });
         return 0;
     }
-    
+
     private async Task downloadMediaItemWithProgress(ProgressTask task, SemaphoreSlim semaphore, BaseItemDto item, string destination)
     {
         try
         {
-            task.Description = $"[green]Waiting to download {item.Name}[/]";
+            task.Description = $"[yellow]Waiting to download {item.Name}[/]";
             await semaphore.WaitAsync();
-            task.Description = $"[green]Starting download {item.Name}[/]";
+            task.Description = $"[lime]Starting download {item.Name}[/]";
             var mediaLength = item.MediaSources.FirstOrDefault()?.Size ?? 0;
             if (mediaLength == 0)
             {
                 task.IsIndeterminate = true;
             }
-            long progress = 0;
             using var mediaStream = await apiCLient.Items[item.Id.Value].File.GetAsync();
             using var fileStream = File.Create(destination);
             var buffer = new byte[81920];
             int bytesRead = 0;
             task.Description = $"[green]Downloading {item.Name}[/]";
             task.StartTask();
-            Task trackerTask = task.IsIndeterminate ? Task.CompletedTask : Task.Run(async () =>
-            {
-                while (progress < mediaLength)
-                {
-                    task.Increment((double)progress / mediaLength * 100);
-                    await Task.Delay(500);
-                }
-            });
             while ((bytesRead = await mediaStream.ReadAsync(buffer, 0, buffer.Length)) > 0)
             {
                 await fileStream.WriteAsync(buffer, 0, bytesRead);
-                progress += bytesRead;
+                if (!task.IsIndeterminate)
+                {
+                    task.Increment((double)bytesRead / mediaLength * 100);
+                }
             }
+            task.Description = $"[blue]Completed download {item.Name}[/]";
         }
         finally
         {
+            task.Increment(1);
             semaphore.Release();
             task.StopTask();
         }
     }
+    private static void AddTaskRow(Table table, ProgressTask task) => table.Rows.Add(
+    [
+        new Markup(task.Description),
+        new Grid().AddColumns(3).AddRow(
+            [
+                new ProgressBarColumn().Render(default, task, default),
+                new PercentageColumn().Render(default, task, default),
+                new RemainingTimeColumn().Render(default, task, default),
+                // Spinner column uses the render options stuff and I'm not sure default actually works here.
+                //new SpinnerColumn(Spinner.Known.Arc).Render(default, task, default)
+            ]
+        ).Centered()
+    ]);
 
     private string sanitizeFileName(string fileName)
     {
